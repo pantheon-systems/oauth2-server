@@ -51,7 +51,7 @@ class DeviceCodeGrant extends AbstractGrant
         RefreshTokenRepositoryInterface $refreshTokenRepository,
         private DateInterval $deviceCodeTTL,
         string $verificationUri,
-        private int $retryInterval = 5
+        private readonly int $retryInterval = 5
     ) {
         $this->setDeviceCodeRepository($deviceCodeRepository);
         $this->setRefreshTokenRepository($refreshTokenRepository);
@@ -101,6 +101,10 @@ class DeviceCodeGrant extends AbstractGrant
             $response->includeVerificationUriComplete();
         }
 
+        if ($this->intervalVisibility === true) {
+            $response->includeInterval();
+        }
+
         $response->setDeviceCodeEntity($deviceCodeEntity);
 
         return $response;
@@ -137,14 +141,19 @@ class DeviceCodeGrant extends AbstractGrant
     ): ResponseTypeInterface {
         // Validate request
         $client = $this->validateClient($request);
-        $scopes = $this->validateScopes($this->getRequestParameter('scope', $request, $this->defaultScope));
         $deviceCodeEntity = $this->validateDeviceCode($request, $client);
 
-        $deviceCodeEntity->setLastPolledAt(new DateTimeImmutable());
-        $this->deviceCodeRepository->persistDeviceCode($deviceCodeEntity);
-
-        // If device code has no user associated, respond with pending
+        // If device code has no user associated, respond with pending or slow down
         if (is_null($deviceCodeEntity->getUserIdentifier())) {
+            $shouldSlowDown = $this->deviceCodePolledTooSoon($deviceCodeEntity->getLastPolledAt());
+
+            $deviceCodeEntity->setLastPolledAt(new DateTimeImmutable());
+            $this->deviceCodeRepository->persistDeviceCode($deviceCodeEntity);
+
+            if ($shouldSlowDown) {
+                throw OAuthServerException::slowDown();
+            }
+
             throw OAuthServerException::authorizationPending();
         }
 
@@ -153,7 +162,7 @@ class DeviceCodeGrant extends AbstractGrant
         }
 
         // Finalize the requested scopes
-        $finalizedScopes = $this->scopeRepository->finalizeScopes($scopes, $this->getIdentifier(), $client, $deviceCodeEntity->getUserIdentifier());
+        $finalizedScopes = $this->scopeRepository->finalizeScopes($deviceCodeEntity->getScopes(), $this->getIdentifier(), $client, $deviceCodeEntity->getUserIdentifier());
 
         // Issue and persist new access token
         $accessToken = $this->issueAccessToken($accessTokenTTL, $client, $deviceCodeEntity->getUserIdentifier(), $finalizedScopes);
@@ -206,10 +215,6 @@ class DeviceCodeGrant extends AbstractGrant
             throw OAuthServerException::invalidRequest('device_code', 'Device code was not issued to this client');
         }
 
-        if ($this->deviceCodePolledTooSoon($deviceCodeEntity->getLastPolledAt()) === true) {
-            throw OAuthServerException::slowDown();
-        }
-
         return $deviceCodeEntity;
     }
 
@@ -259,10 +264,7 @@ class DeviceCodeGrant extends AbstractGrant
         $deviceCode->setExpiryDateTime((new DateTimeImmutable())->add($deviceCodeTTL));
         $deviceCode->setClient($client);
         $deviceCode->setVerificationUri($verificationUri);
-
-        if ($this->getIntervalVisibility() === true) {
-            $deviceCode->setInterval($this->retryInterval);
-        }
+        $deviceCode->setInterval($this->retryInterval);
 
         foreach ($scopes as $scope) {
             $deviceCode->addScope($scope);
